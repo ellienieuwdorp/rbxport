@@ -8,6 +8,8 @@
 mod windowfit;
 mod file_drop;
 mod file_drag;
+#[cfg(target_os = "macos")]
+mod refresh_rate;
 mod startup;
 mod screen_cache;
 mod sentry;
@@ -467,6 +469,12 @@ pub fn run() {
                 app.manage(mounts);
             }
             app.set_menu(crate::menu::build(app.handle())?)?;
+            // macOS: frames at the display's rate, so the waveform scrolls at
+            // 120 a second on a ProMotion display rather than WebKit's 60.
+            #[cfg(target_os = "macos")]
+            if let Some(main) = app.get_webview_window(MAIN_WINDOW) {
+                crate::refresh_rate::follow_display(&main);
+            }
             // Windows: paths of files dropped from Explorer onto a playlist.
             #[cfg(windows)]
             if let Some(main) = app.get_webview_window("main") {
