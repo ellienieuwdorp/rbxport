@@ -10,9 +10,8 @@
  * composites, a process walk in the backend and a re-render every second
  * came to 0.8 % of a core in the app and 2.6 % in the webview against a
  * budget of 0.5 % (measured on a compiled 0.5.1 with the library loaded).
- * So: a reading every four seconds, and the frame rate from two frames
- * rather than ten — the interval between two consecutive frames is the
- * refresh period, which is all ten frames were averaging.
+ * So: a reading every five seconds, and the frame rate from a quarter of a
+ * second of frames rather than a frame interval every second.
  */
 import { useSyncExternalStore } from "react";
 
@@ -24,11 +23,17 @@ import type { Diagnostics } from "@/ipc/types";
 const PERIOD_MS = 5000;
 
 /**
- * Frames timed per reading: two, the least that gives an interval. Every
- * frame asked for here is a frame the compositor has to draw, so this is the
- * whole cost of the FPS figure.
+ * How long each reading counts frames for. One interval between two frames
+ * is not enough: frames do not land exactly a refresh apart, and WebKit
+ * rounds their timestamps to the millisecond, so a single interval under a
+ * 60 fps cap read anywhere from 60 to 77, and at 120 Hz an 8.3 ms interval
+ * reads as 8 or 9 ms, 125 or 111. Over a quarter of a second that millisecond
+ * is under half a frame a second either way, so 60 reads 60 and 120 reads
+ * 120. Every frame asked for here is a frame the compositor has to
+ * draw, so this is the whole cost of the FPS figure: 30 frames every five
+ * seconds at 120 Hz.
  */
-const FRAMES = 2;
+const WINDOW_MS = 250;
 
 export interface AppCost extends Diagnostics {
   /** Frames a second, measured in the webview, or `null` before the first. */
@@ -47,31 +52,42 @@ const NOTHING: AppCost = {
 };
 
 /**
- * Times `FRAMES` frames and returns the rate they arrived at.
+ * Counts frames for `WINDOW_MS` and returns the rate they arrived at.
  *
  * The first frame's timestamp is the start, so the rate is over the gaps
  * between frames rather than from the moment of asking — which included the
- * wait for the first frame and read low.
+ * wait for the first frame and read low. Aborting cancels the frame asked
+ * for, so a readout that goes away mid-count stops drawing frames with it.
  */
-function measureFps(): Promise<number> {
-  return new Promise((resolve) => {
-    let start = 0;
-    let seen = 0;
+function measureFps(signal: AbortSignal): Promise<number> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    let start: number | null = null;
+    let gaps = 0;
+    let frame = 0;
+    const abort = () => {
+      cancelAnimationFrame(frame);
+      reject(new Error("aborted"));
+    };
     const step = (now: number) => {
-      seen += 1;
-      if (seen === 1) {
+      if (start === null) {
         start = now;
-        requestAnimationFrame(step);
-        return;
-      }
-      if (seen < FRAMES) {
-        requestAnimationFrame(step);
-        return;
+      } else {
+        gaps += 1;
       }
       const elapsed = now - start;
-      resolve(elapsed > 0 ? ((seen - 1) / elapsed) * 1000 : 0);
+      if (elapsed < WINDOW_MS) {
+        frame = requestAnimationFrame(step);
+        return;
+      }
+      signal.removeEventListener("abort", abort);
+      resolve((gaps / elapsed) * 1000);
     };
-    requestAnimationFrame(step);
+    signal.addEventListener("abort", abort, { once: true });
+    frame = requestAnimationFrame(step);
   });
 }
 
@@ -85,10 +101,15 @@ function measureFps(): Promise<number> {
  * and only the readout and the processor meter, which subscribe to it,
  * render again. The poller runs while anything subscribes and stops when
  * nothing does.
+ *
+ * Each run of the poller has its own signal, aborted when the last
+ * subscriber leaves. A reading still under way then neither publishes nor
+ * schedules the next, so a readout unmounted and mounted again before a
+ * reading comes back leaves one poller running, not two.
  */
 let current: AppCost = NOTHING;
 const listeners = new Set<() => void>();
-let live = false;
+let run: AbortController | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 function publish(next: AppCost) {
@@ -96,28 +117,29 @@ function publish(next: AppCost) {
   for (const listener of listeners) listener();
 }
 
-async function read() {
+async function read(signal: AbortSignal) {
   try {
     const backend = await getBackend();
-    const [sample, fps] = await Promise.all([backend.appDiagnostics(), measureFps()]);
-    if (live) publish({ ...sample, fps });
+    const [sample, fps] = await Promise.all([backend.appDiagnostics(), measureFps(signal)]);
+    if (!signal.aborted) publish({ ...sample, fps });
   } catch {
     // A build with no backend behind it simply shows nothing.
-    if (live) publish(NOTHING);
+    if (!signal.aborted) publish(NOTHING);
   }
-  if (live) timer = setTimeout(() => void read(), PERIOD_MS);
+  if (!signal.aborted) timer = setTimeout(() => void read(signal), PERIOD_MS);
 }
 
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
-  if (!live) {
-    live = true;
-    void read();
+  if (run === null) {
+    run = new AbortController();
+    void read(run.signal);
   }
   return () => {
     listeners.delete(listener);
-    if (listeners.size === 0) {
-      live = false;
+    if (listeners.size === 0 && run !== null) {
+      run.abort();
+      run = null;
       if (timer !== null) clearTimeout(timer);
       timer = null;
     }
